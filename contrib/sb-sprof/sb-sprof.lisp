@@ -856,7 +856,6 @@ The following keyword args are recognized:
 
 (defun reset ()
   "Reset the profiler."
-  (stop-profiling)
   (setq *sampling* nil)
   (setq *samples* nil)
   (values))

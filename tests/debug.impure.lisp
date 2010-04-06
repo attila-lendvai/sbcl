@@ -81,7 +81,8 @@
 ;;; and that it contains the frames we expect, doesn't contain any
 ;;; "bogus stack frame"s, and contains the appropriate toplevel call
 ;;; and hasn't been cut off anywhere.
-(defun verify-backtrace (test-function frame-specs &key (allow-stunted nil))
+(defun verify-backtrace (test-function frame-specs &key (allow-stunted nil)
+                         (verbosity sb-debug::*verbosity*))
   (labels ((args-equal (want real)
              (cond ((eq '&rest (car want))
                     t)
@@ -96,7 +97,8 @@
         (handler-bind
             ((error (lambda (condition)
                       ;; find the part of the backtrace we're interested in
-                      (let* ((full-backtrace (sb-debug:backtrace-as-list))
+                      (let* ((full-backtrace (sb-debug:backtrace-as-list
+                                              :verbosity verbosity))
                              (backtrace (member (caar frame-specs) full-backtrace
                                                 :key #'car
                                                 :test #'equal)))
@@ -160,7 +162,8 @@
     (assert (verify-backtrace
              (lambda () (test #'optimized))
              (list *undefined-function-frame*
-                   (list `(flet test :in ,*p*) #'optimized)))))
+                   (list `(flet test :in ,*p*) #'optimized))
+             :verbosity 2)))
 
   ;; bug 353: This test fails at least most of the time for x86/linux
   ;; ca. 0.8.20.16. -- WHN
@@ -215,13 +218,15 @@
               :fails-on :alpha)  ; bug 346
     (assert (verify-backtrace (lambda () (test #'optimized))
                               (list '(/ 42 &rest)
-                                    (list `(flet test :in ,*p*) #'optimized)))))
+                                    (list `(flet test :in ,*p*) #'optimized))
+                              :verbosity 2)))
   (with-test (:name (:divide-by-zero :bug-356)
               :fails-on :alpha)  ; bug 356
     (assert (verify-backtrace (lambda () (test #'not-optimized))
                               (list '(/ 42 &rest)
-                                    `((flet not-optimized :in ,*p*))
-                                    (list `(flet test :in ,*p*) #'not-optimized))))))
+                                    '((flet not-optimized :in ,*p*))
+                                    (list '(flet test :in ,*p*) #'not-optimized))
+                              :verbosity 2))))
 
 (with-test (:name (:throw :no-such-tag)
             :fails-on '(or
@@ -231,7 +236,8 @@
   (progn
     (defun throw-test ()
       (throw 'no-such-tag t))
-    (assert (verify-backtrace #'throw-test '((throw-test))))))
+    (assert (verify-backtrace #'throw-test '((throw-test))
+                              :verbosity 2))))
 
 (defun bug-308926 (x)
   (let ((v "foo"))
@@ -282,7 +288,7 @@
   (list opt))
 
 (defmacro with-details (bool &body body)
-  `(let ((sb-debug:*show-entry-point-details* ,bool))
+  `(let ((sb-debug::*verbosity* ,(if bool 3 1)))
      ,@body))
 
 (defun bug-354 (x)

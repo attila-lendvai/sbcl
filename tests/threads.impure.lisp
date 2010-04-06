@@ -580,7 +580,7 @@
               (handler-bind ((error #'(lambda (cond)
                                         (princ cond)
                                         (sb-debug:backtrace
-                                         most-positive-fixnum))))
+                                         :count most-positive-fixnum))))
                 (loop (check-interrupt-count
                        (counter-n *interrupt-counter*))))))))
     (let ((func (lambda ()
@@ -992,7 +992,7 @@
 | (defun crash ()
 |   (setq *debugger-hook*
 |         (lambda (condition old-debugger-hook)
-|           (debug:backtrace 10)
+|           (debug:backtrace :count 10)
 |           (unix:unix-exit 2)))
 |   #+live-dangerously
 |   (mp::start-sigalrm-yield)
@@ -1184,7 +1184,7 @@
                                  (lambda ()
                                    (dotimes (i 1000)
                                      (with-output-to-string (*debug-io*)
-                                       (sb-debug::backtrace 10))))))))
+                                       (sb-debug::backtrace :count 10))))))))
     (wait-for-threads threads)))
 
 (format t "backtrace test done~%")

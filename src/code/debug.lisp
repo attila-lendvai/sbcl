@@ -62,6 +62,13 @@ provide bindings for printer control variables.")
 ;;; nestedness inside debugger command loops
 (defvar *debug-command-level* 0)
 
+;; the default value of the verbosity &key argument where available.
+;; note: changing this also affects what the backtrace looks like.
+(defvar *verbosity* 1)
+
+;; a reasonable default limit when printing backtraces
+(defvar *default-backtrace-size-limit* 1000)
+
 ;;; If this is bound before the debugger is invoked, it is used as the
 ;;; stack top by the debugger.
 (defvar *stack-top-hint* nil)
@@ -170,7 +177,7 @@ Other commands:
 
 ;;;; BACKTRACE
 
-(defun map-backtrace (thunk &key (start 0) (count most-positive-fixnum))
+(defun map-backtrace (visitor &key (start 0) (count most-positive-fixnum))
   (loop
      with result = nil
      for index upfrom 0
@@ -182,44 +189,59 @@ Other commands:
      when (<= start index) do
        (if (minusp (decf count))
            (return result)
-           (setf result (funcall thunk frame)))
+           (setf result (funcall visitor frame)))
      finally (return result)))
 
-(defun backtrace (&optional (count most-positive-fixnum) (stream *debug-io*))
+(defun backtrace (&key (start 0) (count *default-backtrace-size-limit*)
+                  (stream *debug-io*) ((:verbosity *verbosity*) *verbosity*)
+                  (print-frame-source (> *verbosity* 1))
+                  (print-thread-info (> *verbosity* 2)))
   #!+sb-doc
   "Show a listing of the call stack going down from the current frame.
 In the debugger, the current frame is indicated by the prompt. COUNT
-is how many frames to show."
+is how many frames to show, START is where to start.
+
+VERBOSITY controls the printed backtrace like this:
+ 0: #<FRAME>
+ 1: default, maximally cleaned frames
+ 2: don't clean actual function names (e.g. SB-PCL::FAST-METHOD)
+ 3: don't clean entry point details, print as much info as possible
+
+PRINT-FRAME-SOURCE and PRINT-THREAD-INFO also get their default values
+from VERBOSITY."
   (fresh-line stream)
+  (when print-thread-info
+    #!+sb-thread
+    (format stream "Backtrace of ~S:" (or (sb!thread:thread-name
+                                           sb!thread:*current-thread*)
+                                          sb!thread:*current-thread*)))
   (let ((*suppress-print-errors* (if (subtypep 'serious-condition *suppress-print-errors*)
                                      *suppress-print-errors*
                                      'serious-condition))
         (*print-circle* t))
     (handler-bind ((print-not-readable #'print-unreadably))
         (map-backtrace (lambda (frame)
-                         (print-frame-call frame stream :number t))
-                       :count count)))
+                         (print-frame-call frame stream :number t
+                                           :print-frame-source print-frame-source))
+                       :start start :count count)))
   (fresh-line stream)
   (values))
 
-(defun backtrace-as-list (&optional (count most-positive-fixnum))
-  #!+sb-doc
-  "Return a list representing the current BACKTRACE.
-
-Objects in the backtrace with dynamic-extent allocation by the current
-thread are represented by substitutes to avoid references to them from
-leaking outside their legal extent."
+(defun backtrace-as-list (&key (count most-positive-fixnum) (start 0)
+                          ((:verbosity *verbosity*) *verbosity*))
+  #!+sb-doc "Return a list representing the current BACKTRACE."
   (let ((reversed-result (list)))
-    (map-backtrace (lambda (frame)
-                     (let ((frame-list (frame-call-as-list frame)))
-                       (if (listp (cdr frame-list))
-                           (push (mapcar #'replace-dynamic-extent-object frame-list)
-                                 reversed-result)
-                           (push frame-list reversed-result))))
-                   :count count)
+    (map-backtrace
+     (lambda (frame)
+       (let ((frame-list (frame-call-as-list frame)))
+         (if (listp (cdr frame-list))
+             (push (mapcar #'replace-dynamic-extent-object frame-list)
+                   reversed-result)
+             (push frame-list reversed-result))))
+     :count count :start start)
     (nreverse reversed-result)))
 
-(defun frame-call-as-list (frame)
+(defun frame-call-as-list (frame &key ((:verbosity *verbosity*) *verbosity*))
   (multiple-value-bind (name args) (frame-call frame)
     (cons name args)))
 
@@ -278,10 +300,10 @@ thread, NIL otherwise."
 ) ; EVAL-WHEN
 
 ;;; Extract the function argument values for a debug frame.
-(defun map-frame-args (thunk frame)
+(defun map-frame-args (visitor frame)
   (let ((debug-fun (sb!di:frame-debug-fun frame)))
     (dolist (element (sb!di:debug-fun-lambda-list debug-fun))
-      (funcall thunk element))))
+      (funcall visitor element))))
 
 (defun frame-args-as-list (frame)
   (handler-case
@@ -326,10 +348,10 @@ thread, NIL otherwise."
     (sb!di:lambda-list-unavailable ()
       (make-unprintable-object "unavailable lambda list"))))
 
-(defvar *show-entry-point-details* nil)
-
 (defun clean-xep (name args)
-  (values (second name)
+  (values (or (and (consp name)
+                   (second name))
+              name)
           (if (consp args)
               (let ((count (first args))
                     (real-args (rest args)))
@@ -340,7 +362,9 @@ thread, NIL otherwise."
               args)))
 
 (defun clean-&more-processor (name args)
-  (values (second name)
+  (values (or (and (consp name)
+                   (second name))
+              name)
           (if (consp args)
               (let* ((more (last args 2))
                      (context (first more))
@@ -354,44 +378,80 @@ thread, NIL otherwise."
                       (make-unprintable-object "more unavailable arguments")))))
               args)))
 
-(defun frame-call (frame)
-  (labels ((clean-name-and-args (name args)
-             (if (and (consp name) (not *show-entry-point-details*))
-                 ;; FIXME: do we need to deal with
-                 ;; HAIRY-FUNCTION-ENTRY here? I can't make it or
-                 ;; &AUX-BINDINGS appear in backtraces, so they are
-                 ;; left alone for now. --NS 2005-02-28
-                 (case (first name)
-                   ((eval)
-                    ;; The name of an evaluator thunk contains
-                    ;; the source context -- but that makes for a
-                    ;; confusing frame name, since it can look like an
-                    ;; EVAL call with a bogus argument.
-                    (values '#:eval-thunk nil))
-                   ((sb!c::xep sb!c::tl-xep)
-                    (clean-xep name args))
-                   ((sb!c::&more-processor)
-                    (clean-&more-processor name args))
-                   ((sb!c::hairy-arg-processor
-                     sb!c::varargs-entry sb!c::&optional-processor)
-                    (clean-name-and-args (second name) args))
-                   (t
-                    (values name args)))
-                 (values name args))))
-    (let ((debug-fun (sb!di:frame-debug-fun frame)))
-      (multiple-value-bind (name args)
-          (clean-name-and-args (sb!di:debug-fun-name debug-fun)
-                                (frame-args-as-list frame))
-        (values name args (sb!di:debug-fun-kind debug-fun))))))
+;; Cleaning SB-PCL::FAST-METHOD and SB-PCL::SLOW-METHOD is a bit different then
+;; other cleanings in that they are actually part of the method name. But it
+;; makes the backtrace less readable, so we do it on certain *VERBOSITY*.
+(defun clean-slow/fast-method (name args)
+  (values (if (and (consp name)
+                   (rest name))
+              (if (<= *verbosity* 1)
+                  (second name)
+                  (rest name))
+              name)
+          (if (and (consp args)
+                   (consp name))
+              (let ((last (car (last name))))
+                (or (and (consp last)
+                         ;; safely get the length of the lambda-list and the last
+                         ;; n args are the actual args of the function call
+                         (loop for cell = last :then (cdr cell)
+                               while cell
+                               unless (consp cell) do (return nil)
+                               count 1 :into arg-count
+                               finally (return (last args arg-count))))
+                    args))
+              args)))
+
+(defun frame-call (frame &key ((:verbosity *verbosity*) *verbosity*))
+  (let* ((debug-fun (sb!di:frame-debug-fun frame))
+         (name (sb!di:debug-fun-name debug-fun))
+         (args (frame-args-as-list frame)))
+    (labels ((clean-name-and-args (name args)
+               (if (consp name)
+                   ;; FIXME: do we need to deal with
+                   ;; HAIRY-FUNCTION-ENTRY here? I can't make it or
+                   ;; &AUX-BINDINGS appear in backtraces, so they are
+                   ;; left alone for now. --NS 2005-02-28
+                   (case (first name)
+                     ((eval)
+                      ;; The name of an evaluator thunk contains
+                      ;; the source context -- but that makes for a
+                      ;; confusing frame name, since it can look like an
+                      ;; EVAL call with a bogus argument.
+                      (values '#:eval-thunk nil))
+                     ((sb!c::xep sb!c::tl-xep)
+                      (clean-xep name args))
+                     ((sb!c::&more-processor)
+                      (clean-&more-processor name args))
+                     ((sb!pcl::fast-method sb!pcl::slow-method)
+                      (clean-slow/fast-method name args))
+                     ((sb!c::hairy-arg-processor
+                       sb!c::varargs-entry sb!c::&optional-processor)
+                      (clean-name-and-args (second name) args))
+                     (t (values name args)))
+                   (values name args))))
+      (when (<= *verbosity* 2)
+        (loop named cleaning do
+              (multiple-value-bind (new-name new-args)
+                  (clean-name-and-args name args)
+                (when (or (not new-name)
+                          (and (eq new-name name)
+                               (eq new-args args)))
+                  (return-from cleaning))
+                (setf name new-name
+                      args new-args))))
+      (values name args (sb!di:debug-fun-kind debug-fun)))))
 
 (defun ensure-printable-object (object)
   (handler-case
       (with-open-stream (out (make-broadcast-stream))
         (prin1 object out)
         object)
-    (error (cond)
-      (declare (ignore cond))
-      (make-unprintable-object "error printing object"))))
+    (serious-condition (condition)
+      (make-unprintable-object
+       (format nil "error printing object: ~A"
+               (ignore-errors
+                 (princ-to-string condition)))))))
 
 (defun frame-call-arg (var location frame)
   (lambda-var-dispatch var location
@@ -404,13 +464,15 @@ thread, NIL otherwise."
 ;;; zero indicates just printing the DEBUG-FUN's name, and one
 ;;; indicates displaying call-like, one-liner format with argument
 ;;; values.
-(defun print-frame-call (frame stream &key (verbosity 1) (number nil))
+(defun print-frame-call (frame stream &key ((:verbosity *verbosity*) *verbosity*) (number nil)
+                         (print-frame-source (> *verbosity* 1)))
   (when number
-    (format stream "~&~S: " (sb!di:frame-number frame)))
-  (if (zerop verbosity)
+    (format stream "~&~3,' D: " (sb!di:frame-number frame)))
+  (if (zerop *verbosity*)
       (let ((*print-readably* nil))
         (prin1 frame stream))
-      (multiple-value-bind (name args kind) (frame-call frame)
+      (multiple-value-bind (name args kind)
+          (frame-call frame)
         (pprint-logical-block (stream nil :prefix "(" :suffix ")")
           ;; Since we go to some trouble to make nice informative function
           ;; names like (PRINT-OBJECT :AROUND (CLOWN T)), let's make sure
@@ -425,28 +487,28 @@ thread, NIL otherwise."
           ;; of values. Special case *PRINT-PRETTY* for eval frames:
           ;; if *PRINT-LINES* is 1, turn off pretty-printing.
           (let ((*print-pretty*
-                  (if (and (eql 1 *print-lines*)
-                           (member name '(eval simple-eval-in-lexenv)))
-                      nil
-                      *print-pretty*))))
-          (if (listp args)
-              (format stream "~{ ~_~S~}" args)
-              (format stream " ~S" args)))
-        (when kind
-          (format stream "[~S]" kind))))
-  (when (>= verbosity 2)
+                 (if (and (eql 1 *print-lines*)
+                          (member name '(eval simple-eval-in-lexenv)))
+                     nil
+                     *print-pretty*)))
+            (if (listp args)
+                (format stream "~{ ~_~S~}" args)
+                (format stream " ~S" args))))
+        (when (and kind (>= *verbosity* 1))
+          (format stream " [~S]" kind))))
+  (when print-frame-source
     (let ((loc (sb!di:frame-code-location frame)))
       (handler-case
           (progn
             ;; FIXME: Is this call really necessary here? If it is,
             ;; then the reason for it should be unobscured.
             (sb!di:code-location-debug-block loc)
-            (format stream "~%source: ")
-            (prin1 (code-location-source-form loc 0) stream))
+            (format stream "~%source: ~S" (code-location-source-form loc 0)))
         (sb!di:debug-condition (ignore)
           ignore)
-        (error (c)
-          (format stream "~&error finding source: ~A" c))))))
+        (serious-condition (c)
+          (when (> *verbosity* 2)
+            (format stream "~&error finding source: ~A" c)))))))
 
 ;;;; INVOKE-DEBUGGER
 
@@ -486,7 +548,8 @@ thread, NIL otherwise."
         ;; any default we might use is less useful than just reusing
         ;; the global values.
         (original-package *package*)
-        (original-print-pretty *print-pretty*))
+        (original-print-pretty *print-pretty*)
+        (original-print-right-margin *print-right-margin*))
     (with-standard-io-syntax
       (with-sane-io-syntax
           (let (;; We want the printer and reader to be in a useful
@@ -506,6 +569,7 @@ thread, NIL otherwise."
                 ;; rebindings here.
                 (sb!kernel:*current-level-in-print* 0)
                 (*package* original-package)
+                (*print-right-margin* original-print-right-margin)
                 (*print-pretty* original-print-pretty)
                 ;; Clear the circularity machinery to try to to reduce the
                 ;; pain from sharing the circularity table across all
@@ -691,7 +755,7 @@ reset to ~S."
           (finish-output *error-output*)
           ;; (Where to truncate the BACKTRACE is of course arbitrary, but
           ;; it seems as though we should at least truncate it somewhere.)
-          (sb!debug:backtrace 128 *error-output*)
+          (backtrace :count 128 :stream *error-output*)
           (format
            *error-output*
            "~%unhandled condition in --disable-debugger mode, quitting~%")
@@ -834,7 +898,7 @@ and LDB (the low-level debugger).  See also ENABLE-DEBUGGER."
              (setf *suppress-frame-print* nil))
             (t
              (terpri *debug-io*)
-             (print-frame-call *current-frame* *debug-io* :verbosity 2)))
+             (print-frame-call *current-frame* *debug-io*)))
       (loop
        (catch 'debug-loop-catcher
          (handler-bind ((error (lambda (condition)
@@ -1257,7 +1321,7 @@ and LDB (the low-level debugger).  See also ENABLE-DEBUGGER."
   (show-restarts *debug-restarts* *debug-io*))
 
 (!def-debug-command "BACKTRACE" ()
-  (backtrace (read-if-available most-positive-fixnum)))
+  (backtrace :count (read-if-available *default-backtrace-size-limit*)))
 
 (!def-debug-command "PRINT" ()
   (print-frame-call *current-frame* *debug-io*))

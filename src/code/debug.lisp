@@ -157,6 +157,75 @@ Other commands:
     Discard all pending input on *STANDARD-INPUT*. (This can be
     useful when the debugger was invoked to handle an error in
     deeply nested input syntax, and now the reader is confused.)")
+
+;;; Oh, what a tangled web we weave when we preserve backwards
+;;; compatibility with 1968-style use of global variables to control
+;;; per-stream i/o properties; there's really no way to get this
+;;; quite right, but we do what we can.
+(defmacro with-debug-io-syntax (&body body)
+  `(funcall-with-debug-io-syntax (lambda () ,@body)))
+
+(defun funcall-with-debug-io-syntax (fun &rest rest)
+  (declare (type function fun))
+  ;; Try to force the other special variables into a useful state.
+  (let (;; Protect from WITH-STANDARD-IO-SYNTAX some variables where
+        ;; any default we might use is less useful than just reusing
+        ;; the global values.
+        (original-package *package*)
+        (original-print-pretty *print-pretty*)
+        (original-print-right-margin *print-right-margin*))
+    (with-standard-io-syntax
+      (with-sane-io-syntax
+          (let (;; We want the printer and reader to be in a useful
+                ;; state, regardless of where the debugger was invoked
+                ;; in the program. WITH-STANDARD-IO-SYNTAX and
+                ;; WITH-SANE-IO-SYNTAX do much of what we want, but
+                ;;   * It doesn't affect our internal special variables
+                ;;     like *CURRENT-LEVEL-IN-PRINT*.
+                ;;   * It isn't customizable.
+                ;;   * It sets *PACKAGE* to COMMON-LISP-USER, which is not
+                ;;     helpful behavior for a debugger.
+                ;;   * There's no particularly good debugger default for
+                ;;     *PRINT-PRETTY*, since T is usually what you want
+                ;;     -- except absolutely not what you want when you're
+                ;;     debugging failures in PRINT-OBJECT logic.
+                ;; We try to address all these issues with explicit
+                ;; rebindings here.
+                (sb!kernel:*current-level-in-print* 0)
+                (*package* original-package)
+                (*print-right-margin* original-print-right-margin)
+                (*print-pretty* original-print-pretty)
+                ;; Clear the circularity machinery to try to reduce the
+                ;; pain from sharing the circularity table across all
+                ;; streams; if these are not rebound here, then setting
+                ;; *PRINT-CIRCLE* within the debugger when debugging in a
+                ;; state where something circular was being printed (e.g.,
+                ;; because the debugger was entered on an error in a
+                ;; PRINT-OBJECT method) makes a hopeless mess. Binding them
+                ;; here does seem somewhat ugly because it makes it more
+                ;; difficult to debug the printing-of-circularities code
+                ;; itself; however, as far as I (WHN, 2004-05-29) can see,
+                ;; that's almost entirely academic as long as there's one
+                ;; shared *C-H-T* for all streams (i.e., it's already
+                ;; unreasonably difficult to debug print-circle machinery
+                ;; given the buggy crosstalk between the debugger streams
+                ;; and the stream you're trying to watch), and any fix for
+                ;; that buggy arrangement will likely let this hack go away
+                ;; naturally.
+                (sb!impl::*circularity-hash-table* . nil)
+                (sb!impl::*circularity-counter* . nil)
+                (*readtable* *debug-readtable*))
+            (progv
+                ;; (Why NREVERSE? PROGV makes the later entries have
+                ;; precedence over the earlier entries.
+                ;; *DEBUG-PRINT-VARIABLE-ALIST* is called an alist, so it's
+                ;; expected that its earlier entries have precedence. And
+                ;; the earlier-has-precedence behavior is mostly more
+                ;; convenient, so that programmers can use PUSH or LIST* to
+                ;; customize *DEBUG-PRINT-VARIABLE-ALIST*.)
+                (nreverse (mapcar #'car *debug-print-variable-alist*))
+                (nreverse (mapcar #'cdr *debug-print-variable-alist*))
+              (apply fun rest)))))))
 
 
 ;;; If LOC is an unknown location, then try to find the block start
@@ -209,23 +278,24 @@ VERBOSITY controls the printed backtrace like this:
 
 PRINT-FRAME-SOURCE and PRINT-THREAD-INFO also get their default values
 from VERBOSITY."
-  (fresh-line stream)
-  (when print-thread-info
-    #!+sb-thread
-    (format stream "Backtrace of ~S:" (or (sb!thread:thread-name
-                                           sb!thread:*current-thread*)
-                                          sb!thread:*current-thread*)))
-  (let ((*suppress-print-errors* (if (subtypep 'serious-condition *suppress-print-errors*)
-                                     *suppress-print-errors*
-                                     'serious-condition))
-        (*print-circle* t))
-    (handler-bind ((print-not-readable #'print-unreadably))
+  (with-debug-io-syntax
+    (fresh-line stream)
+    (when print-thread-info
+      #!+sb-thread
+      (format stream "Backtrace of ~S:" (or (sb!thread:thread-name
+                                             sb!thread:*current-thread*)
+                                            sb!thread:*current-thread*)))
+    (let ((*suppress-print-errors* (if (subtypep 'serious-condition *suppress-print-errors*)
+                                       *suppress-print-errors*
+                                       'serious-condition))
+          (*print-circle* t))
+      (handler-bind ((print-not-readable #'print-unreadably))
         (map-backtrace (lambda (frame)
                          (print-frame-call frame stream :number t
                                            :print-frame-source print-frame-source))
                        :start start :count count)))
-  (fresh-line stream)
-  (values))
+    (fresh-line stream)
+    (values)))
 
 (defun backtrace-as-list (&key (count most-positive-fixnum) (start 0)
                           ((:verbosity *verbosity*) *verbosity*))
@@ -469,8 +539,7 @@ thread, NIL otherwise."
   (when number
     (format stream "~&~3,' D: " (sb!di:frame-number frame)))
   (if (zerop *verbosity*)
-      (let ((*print-readably* nil))
-        (prin1 frame stream))
+      (prin1 frame stream)
       (multiple-value-bind (name args kind)
           (frame-call frame)
         (pprint-logical-block (stream nil :prefix "(" :suffix ")")
@@ -537,72 +606,6 @@ thread, NIL otherwise."
 (defvar *debug-condition*)
 (defvar *nested-debug-condition*)
 
-;;; Oh, what a tangled web we weave when we preserve backwards
-;;; compatibility with 1968-style use of global variables to control
-;;; per-stream i/o properties; there's really no way to get this
-;;; quite right, but we do what we can.
-(defun funcall-with-debug-io-syntax (fun &rest rest)
-  (declare (type function fun))
-  ;; Try to force the other special variables into a useful state.
-  (let (;; Protect from WITH-STANDARD-IO-SYNTAX some variables where
-        ;; any default we might use is less useful than just reusing
-        ;; the global values.
-        (original-package *package*)
-        (original-print-pretty *print-pretty*)
-        (original-print-right-margin *print-right-margin*))
-    (with-standard-io-syntax
-      (with-sane-io-syntax
-          (let (;; We want the printer and reader to be in a useful
-                ;; state, regardless of where the debugger was invoked
-                ;; in the program. WITH-STANDARD-IO-SYNTAX and
-                ;; WITH-SANE-IO-SYNTAX do much of what we want, but
-                ;;   * It doesn't affect our internal special variables
-                ;;     like *CURRENT-LEVEL-IN-PRINT*.
-                ;;   * It isn't customizable.
-                ;;   * It sets *PACKAGE* to COMMON-LISP-USER, which is not
-                ;;     helpful behavior for a debugger.
-                ;;   * There's no particularly good debugger default for
-                ;;     *PRINT-PRETTY*, since T is usually what you want
-                ;;     -- except absolutely not what you want when you're
-                ;;     debugging failures in PRINT-OBJECT logic.
-                ;; We try to address all these issues with explicit
-                ;; rebindings here.
-                (sb!kernel:*current-level-in-print* 0)
-                (*package* original-package)
-                (*print-right-margin* original-print-right-margin)
-                (*print-pretty* original-print-pretty)
-                ;; Clear the circularity machinery to try to to reduce the
-                ;; pain from sharing the circularity table across all
-                ;; streams; if these are not rebound here, then setting
-                ;; *PRINT-CIRCLE* within the debugger when debugging in a
-                ;; state where something circular was being printed (e.g.,
-                ;; because the debugger was entered on an error in a
-                ;; PRINT-OBJECT method) makes a hopeless mess. Binding them
-                ;; here does seem somewhat ugly because it makes it more
-                ;; difficult to debug the printing-of-circularities code
-                ;; itself; however, as far as I (WHN, 2004-05-29) can see,
-                ;; that's almost entirely academic as long as there's one
-                ;; shared *C-H-T* for all streams (i.e., it's already
-                ;; unreasonably difficult to debug print-circle machinery
-                ;; given the buggy crosstalk between the debugger streams
-                ;; and the stream you're trying to watch), and any fix for
-                ;; that buggy arrangement will likely let this hack go away
-                ;; naturally.
-                (sb!impl::*circularity-hash-table* . nil)
-                (sb!impl::*circularity-counter* . nil)
-                (*readtable* *debug-readtable*))
-            (progv
-                ;; (Why NREVERSE? PROGV makes the later entries have
-                ;; precedence over the earlier entries.
-                ;; *DEBUG-PRINT-VARIABLE-ALIST* is called an alist, so it's
-                ;; expected that its earlier entries have precedence. And
-                ;; the earlier-has-precedence behavior is mostly more
-                ;; convenient, so that programmers can use PUSH or LIST* to
-                ;; customize *DEBUG-PRINT-VARIABLE-ALIST*.)
-                (nreverse (mapcar #'car *debug-print-variable-alist*))
-                (nreverse (mapcar #'cdr *debug-print-variable-alist*))
-              (apply fun rest)))))))
-
 ;;; This function is not inlined so it shows up in the backtrace; that
 ;;; can be rather handy when one has to debug the interplay between
 ;;; *INVOKE-DEBUGGER-HOOK* and *DEBUGGER-HOOK*.
@@ -631,8 +634,8 @@ thread, NIL otherwise."
                (package-name *package*))
     (setf *package* (find-package :cl-user))
     (format *error-output*
-            "The value of ~S was not an undeleted PACKAGE. It has been
-reset to ~S."
+            "The value of ~S was not an undeleted PACKAGE. It has been ~
+             reset to ~S."
             '*package* *package*))
 
   ;; Before we start our own output, finish any pending output.
@@ -641,7 +644,8 @@ reset to ~S."
   ;; or so, which'd be confusing.
   (flush-standard-output-streams)
 
-  (funcall-with-debug-io-syntax #'%invoke-debugger condition))
+  (with-debug-io-syntax
+    (%invoke-debugger condition)))
 
 (defun %print-debugger-invocation-reason (condition stream)
   (format stream "~2&")

@@ -1010,7 +1010,8 @@
   ((name :initarg :name :reader implicit-generic-function-name))
   (:report
    (lambda (condition stream)
-     (format stream "~@<Implicitly creating new generic function ~S.~:@>"
+     (format stream "~@<Implicitly creating new generic function ~
+                     ~/sb-impl::print-symbol-with-prefix/.~:@>"
              (implicit-generic-function-name condition)))))
 
 (define-condition extension-failure (reference-condition simple-error)

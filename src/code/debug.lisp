@@ -1132,7 +1132,7 @@ and LDB (the low-level debugger).  See also ENABLE-DEBUGGER."
                       (push name names-used))))
              (incf count))))))
 
-(defvar *debug-loop-fun* #'debug-loop-fun
+(defvar *debug-loop-fun* 'debug-loop-fun
   "A function taking no parameters that starts the low-level debug loop.")
 
 ;;; When the debugger is invoked due to a stepper condition, we don't
